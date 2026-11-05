@@ -1,5 +1,6 @@
 import certifi
 from collections import OrderedDict, defaultdict, Counter
+import contextlib
 import copy
 import csv
 import datetime
@@ -11,6 +12,7 @@ import getpass
 from getpass import getpass
 import glob
 import hashlib
+import io
 from itertools import chain
 from IPython import get_ipython
 import json
@@ -58,30 +60,132 @@ def round_numeric_columns(frame, decimals=None):
 ################################################################################################################################################################################
 #3.02
 ################################################################################################################################################################################
+RATING_BATTERY_EXCLUDED_CATEGORIES = ("BESS expansion",)   #raw Battery Categories the Ratings Report does not print (future expansion candidates, like the Generator expansion candidates that no Generator group contains); set to () to compare every raw Battery unit
+#Ratings Report units that are built from the Generator and Battery sheets of the raw data in addition to the notebook's alias_measures (MW, MBTU). A spec is ACTIVE only when the Blueprint_rat sheet of the
+#template has a row with that Alias AND that Class (so Blueprint_rat stays the list of what is validated). Every Timeslice = 'All Periods' / 'Off-Peak' / 'On-Peak' is read from its own raw rows.
+#  alias            = the text after the ':' of the printed row label            class = the Blueprint_rat Class (lower case)
+#  frame            = which raw sheet the rows come from ('generator' or 'battery')   collections = ((raw Collection, identifier column), ...)
+#  column           = the raw measure column                                      factor = raw column -> report unit (GWh -> MWH 1000, $000 -> $ 1000, MWh -> MWh 1)
+#  group_class      = the class used to find the raw units (Generator.Fuels rows take the Category of their parent Generator)
+#  may_be_missing   = True: when the raw column does not exist or holds no value yet, the kind of row is skipped and said so (it is picked up as soon as the raw data is populated)
+#  only_if_in_report= True: used only for a Ratings section that really prints rows with this alias
+RATING_NEW_MEASURE_SPECS = [
+    {"alias": "Var Cost", "class": "generator", "frame": "generator", "collections": (("Generator", "Child Name"),), "column": "Total System Cost ($000)", "label": "Total System Cost ($000)", "factor": 1000},
+    {"alias": "Var O&M", "class": "generator", "frame": "generator", "collections": (("Generator", "Child Name"),), "column": "VO&M Cost ($000)", "label": "VO&M Cost ($000)", "factor": 1000},
+    {"alias": "Use", "class": "generator.fuels", "group_class": "generator", "frame": "generator", "collections": (("Generator.Fuels", "Parent Name"),), "column": "Offtake (BBtu)", "label": "Offtake (BBtu)", "factor": 1000, "only_if_in_report": True},
+    {"alias": "$", "class": "generator.fuels", "group_class": "generator", "frame": "generator", "collections": (("Generator.Fuels", "Parent Name"),), "column": "Cost ($000)", "label": "Cost ($000)", "factor": 1000, "only_if_in_report": True},
+    {"alias": "Chrg", "class": "battery", "frame": "battery", "exclude_categories": RATING_BATTERY_EXCLUDED_CATEGORIES, "collections": (("Battery", "Child Name"),), "column": "Load (GWh)", "label": "Battery Load (GWh)", "factor": 1000, "may_be_missing": True},
+    {"alias": "Dchrg", "class": "battery", "frame": "battery", "exclude_categories": RATING_BATTERY_EXCLUDED_CATEGORIES, "collections": (("Battery", "Child Name"),), "column": "Generation (GWh)", "label": "Battery Generation (GWh)", "factor": 1000, "may_be_missing": True},
+    {"alias": "Var O&M", "class": "battery", "frame": "battery", "exclude_categories": RATING_BATTERY_EXCLUDED_CATEGORIES, "collections": (("Battery", "Child Name"),), "column": "VO&M Cost ($000)", "label": "VO&M Cost ($000)", "factor": 1000, "may_be_missing": True},
+    {"alias": "Storage", "class": "battery", "frame": "battery", "exclude_categories": RATING_BATTERY_EXCLUDED_CATEGORIES, "collections": (("Battery", "Child Name"),), "column": "Energy (MWh)", "label": "Energy (MWh)", "factor": 1, "may_be_missing": True},
+]
+RATING_PENDING_REPORTED = set()   #"raw data not available yet" lines already printed (each is printed once per run of the block: clear it with RATING_PENDING_REPORTED.clear())
+class RatingFrameHolder:
+    """Carries the prepared raw Battery frame of ONE Timeslice (and the proof that it holds only that Timeslice) on the .attrs of the raw Generator frame of the same Timeslice, so every function that already receives the Generator frame (build_raw_ratings_tables, build_rating_raw_name_lookup, ...) also reaches the Battery rows without a change of its arguments. It is never copied (pandas copies .attrs when a frame is sliced)."""
+    def __init__(self, frame, proven, proof_text):
+        self.frame, self.proven, self.proof_text = frame, proven, proof_text
+    def __deepcopy__(self, memo):
+        return self
+    def __copy__(self):
+        return self
+def rating_measure_factor(measure, default_factor):
+    """Raw column -> report unit factor of one kind of Ratings Report row: the 'factor' of the measure when it has one (Storage = MWh x 1), else the factor of the block (RATING_UNIT_FACTOR = 1000)."""
+    return measure.get("factor", default_factor)
+def rating_measure_source_frame(generator_frame, measure):
+    """The raw frame a measure is read from: the Generator frame itself, or the Battery frame carried on its .attrs. Returns frame (None when it is not available) and a problem text ('' when fine)."""
+    if measure.get("frame", "generator") != "battery":
+        return generator_frame, ""
+    holder = generator_frame.attrs.get("rating_battery")
+    if holder is None:
+        return None, "the raw Battery sheet was not loaded with the Generator frame (load_raw_generator_for_timeslice)"
+    if not holder.proven:
+        return None, f"Timeslice proof of the raw Battery sheet failed ({holder.proof_text})"
+    return holder.frame, ""
+def rating_measure_problem(generator_frame, measure):
+    """'' when the raw column of a measure exists and holds at least one value in every collection it reads; else the reason (raw column not in the sheet, collection not in the sheet, or the column is still blank). Used to say that the raw data is not available YET."""
+    source_frame, problem = rating_measure_source_frame(generator_frame, measure)
+    if source_frame is None:
+        return problem
+    sheet_name = "Battery" if measure.get("frame", "generator") == "battery" else "Generator"
+    if measure["column"] not in source_frame.columns:
+        return f"the raw {sheet_name} sheet has no column '{measure['column']}'"
+    for collection_name, _identifier_column in measure["collections"]:
+        collection_rows = source_frame[source_frame["Collection"].astype(str).str.strip() == collection_name]
+        if len(collection_rows) == 0:
+            return f"the raw {sheet_name} sheet has no '{collection_name}' rows"
+        if collection_rows[measure["column"]].notna().sum() == 0:
+            return f"the raw {sheet_name} column '{measure['column']}' has no values yet"
+    return ""
+def rating_definition_active(rating_definition, report_rows):
+    """False for a kind of Ratings Report row that is used only when the Ratings section prints rows with its alias (only_if_in_report) and the section prints none."""
+    if not rating_definition["measure"].get("only_if_in_report"):
+        return True
+    alias_lower = rating_definition["alias"].lower()
+    return any(report_row["alias"].lower() == alias_lower for report_row in report_rows)
+def rating_alias_basis(rating_definitions, alias_text, default_factor):
+    """Text of the raw basis of ONE alias, for the section titles: ('Generation (GWh) x 1000', 'Generation (GWh) x 1000'). An alias that has several definitions (Var O&M = Generator + Battery) lists every distinct basis once. Returns label_text, column_text."""
+    label_parts, column_parts = [], []
+    for definition in rating_definitions:
+        if definition["alias"].lower() != alias_text.lower():
+            continue
+        measure = definition["measure"]
+        factor_text = f"{rating_measure_factor(measure, default_factor):g}"
+        label_part, column_part = f"{measure['label']} x {factor_text}", f"{measure['column']} x {factor_text}"
+        if label_part not in label_parts:
+            label_parts.append(label_part)
+        if column_part not in column_parts:
+            column_parts.append(column_part)
+    return " / ".join(label_parts), " / ".join(column_parts)
 def read_rating_measure_definitions(template_data_path, alias_measures):
-    """Every kind of Ratings Report row to compare, from the template sheet Blueprint_rat (columns Class, Group, Property, Alias): one definition per Blueprint_rat row whose Alias (the text after the ':' of the printed row label, compared ignoring case: 'MW', 'MBTU') is a key of alias_measures ({alias in lower case: {'collections': ((raw collection, identifier column), ...), 'column': raw measure column, 'label': text}}). The (class, group) of the row gives the raw units of the row. When the sheet cannot be read, or has no row for an alias of alias_measures, that alias is added with the default group (generator, thermal) and said so. Returns a list of {'group_key', 'alias', 'measure': the alias_measures entry, 'source'} (in the order of alias_measures) and a list of note texts."""
-    notes, definitions, found_aliases = [], [], set()
+    """Every kind of Ratings Report row to compare, from the template sheet Blueprint_rat (columns Class, Group, Property, Alias): one definition per Blueprint_rat row whose Alias (the text after the ':' of the printed row label, compared ignoring case: 'MW', 'MBTU', 'Var Cost', 'Var O&M', 'Chrg', 'Dchrg', 'Storage') is a key of alias_measures ({alias in lower case: {'collections': ((raw collection, identifier column), ...), 'column': raw measure column, 'label': text}}) or has a spec in RATING_NEW_MEASURE_SPECS (matched on the alias AND the Class of the Blueprint_rat row, so 'Var O&M' of Generator and 'Var O&M' of Battery are two definitions). The (class, group) of the row gives the raw units of the row. When the sheet cannot be read, or has no row for an alias of alias_measures, that alias is added with the default group (generator, thermal) and said so. A Blueprint_rat row that has no raw measure at all is said so and is not compared. Returns a list of {'group_key', 'alias', 'measure': the alias_measures / spec entry, 'source'} (alias_measures first, in their order, then the other rows in the order of Blueprint_rat) and a list of note texts."""
+    notes, definitions, found_aliases, found_specs = [], [], set(), set()
     try:
         blueprint_rat = pd.read_excel(template_data_path, sheet_name="Blueprint_rat", dtype=str).fillna("")
         blueprint_rat.columns = [str(c).strip() for c in blueprint_rat.columns]
         for rat_row in blueprint_rat.to_dict("records"):
             alias_text = str(rat_row.get("Alias", "")).strip()
-            if alias_text.lower() in alias_measures and alias_text.lower() not in found_aliases:
+            class_lower, group_lower = str(rat_row.get("Class", "")).strip().lower(), str(rat_row.get("Group", "")).strip().lower()
+            if alias_text == "" and class_lower == "":
+                continue
+            measure = None
+            if alias_text.lower() in alias_measures:
+                if alias_text.lower() in found_aliases:
+                    continue
                 found_aliases.add(alias_text.lower())
-                definitions.append({"group_key": (str(rat_row.get("Class", "")).strip().lower(), str(rat_row.get("Group", "")).strip().lower()), "alias": alias_text, "measure": alias_measures[alias_text.lower()],
-                                    "source": f"Blueprint_rat: {rat_row.get('Class', '')} / {rat_row.get('Group', '')} / {rat_row.get('Property', '')} (alias {alias_text})"})
+                measure = alias_measures[alias_text.lower()]
+            else:
+                for spec in RATING_NEW_MEASURE_SPECS:
+                    if spec["alias"].lower() == alias_text.lower() and spec["class"] == class_lower:
+                        if (alias_text.lower(), class_lower) not in found_specs:
+                            found_specs.add((alias_text.lower(), class_lower))
+                            measure = spec
+                        break
+                if measure is None:
+                    if not any(spec["alias"].lower() == alias_text.lower() and spec["class"] == class_lower for spec in RATING_NEW_MEASURE_SPECS):
+                        notes.append(f"Blueprint_rat row {rat_row.get('Class', '')} / {rat_row.get('Group', '')} / {rat_row.get('Property', '')} (alias {alias_text}) has no raw measure defined (alias_measures / RATING_NEW_MEASURE_SPECS): it is not compared")
+                    continue
+            definitions.append({"group_key": (measure.get("group_class", class_lower), group_lower), "alias": alias_text, "measure": measure,
+                                "source": f"Blueprint_rat: {rat_row.get('Class', '')} / {rat_row.get('Group', '')} / {rat_row.get('Property', '')} (alias {alias_text})"})
     except Exception as exc:
         notes.append(f"Blueprint_rat could not be read ({type(exc).__name__}: {str(exc)[:80]})")
     for alias_lower, measure in alias_measures.items():
         if alias_lower not in found_aliases:
             notes.append(f"Blueprint_rat has no row with alias '{alias_lower.upper()}': the default group generator / thermal is used")
             definitions.append({"group_key": ("generator", "thermal"), "alias": alias_lower.upper(), "measure": measure, "source": f"default: generator / thermal (alias {alias_lower.upper()})"})
-    definitions.sort(key=lambda d: list(alias_measures).index(d["alias"].lower()))
+    notebook_aliases = list(alias_measures)
+    definitions.sort(key=lambda d: notebook_aliases.index(d["alias"].lower()) if d["alias"].lower() in notebook_aliases else len(notebook_aliases))
     return definitions, notes
-def build_rating_raw_rows(generator_frame, month_labels, value_columns, name_map, group_assets, group_key, group_extra_includes, extra_match_case, collections, measure_column, unit_factor):
-    """The raw side of one kind of Ratings Report row (for example '<name>:MW' = the Generator Generation, '<name>:MBTU' = the generator fuel Offtake) for ONE Timeslice. generator_frame = the raw Generator frame of that Timeslice (all collections). collections = ((collection, identifier column), ...): every listed collection is read and the values of the same unit are ADDED (for example Generator.Fuels + Generator.Start Fuels by Parent Name). A row belongs to the group group_key when the raw Category of its unit is in group_assets (a Generator.* row takes the Category of its parent generator) or it matches the name-level includes of group_extra_includes (a unit of that Category whose name contains one of the strings). Each unit is renamed to the name the report prints (name_map; units that share a printed name are added up), measure_column x unit_factor (1000 = GWh -> MWH, BBtu -> MBTU), a month with no raw value stays blank, Tot-YYYY = the sum of that year's months and Total = the sum of all months. Returns {name key: {'printed': printed name, 'raw_names': sorted raw unit names, 'values': array in the order of value_columns}}."""
+def build_rating_raw_rows(generator_frame, month_labels, value_columns, name_map, group_assets, group_key, group_extra_includes, extra_match_case, collections, measure_column, unit_factor, measure=None):
+    """The raw side of one kind of Ratings Report row (for example '<name>:MW' = the Generator Generation, '<name>:MBTU' = the generator fuel Offtake) for ONE Timeslice. generator_frame = the raw Generator frame of that Timeslice (all collections). collections = ((collection, identifier column), ...): every listed collection is read and the values of the same unit are ADDED (for example Generator.Fuels + Generator.Start Fuels by Parent Name). A row belongs to the group group_key when the raw Category of its unit is in group_assets (a Generator.* row takes the Category of its parent generator) or it matches the name-level includes of group_extra_includes (a unit of that Category whose name contains one of the strings). Each unit is renamed to the name the report prints (name_map; units that share a printed name are added up), measure_column x unit_factor (1000 = GWh -> MWH, BBtu -> MBTU), a month with no raw value stays blank, Tot-YYYY = the sum of that year's months and Total = the sum of all months. Returns {name key: {'printed': printed name, 'raw_names': sorted raw unit names, 'values': array in the order of value_columns}}. measure = the alias_measures / RATING_NEW_MEASURE_SPECS entry (optional): its 'frame' = 'battery' reads the Battery rows carried on generator_frame.attrs, 'exclude_categories' leaves raw Categories out, and 'may_be_missing' returns {} (instead of failing) while the raw column does not exist or holds no value yet."""
+    measure = measure or {}
+    if measure.get("may_be_missing") and rating_measure_problem(generator_frame, measure) != "":
+        return {}
+    generator_frame, frame_problem = rating_measure_source_frame(generator_frame, measure)
+    if generator_frame is None:
+        raise KeyError(frame_problem)
     if measure_column not in generator_frame.columns:
-        raise KeyError(f"the raw Generator frame has no column '{measure_column}'")
+        raise KeyError(f"the raw {'Battery' if measure.get('frame') == 'battery' else 'Generator'} frame has no column '{measure_column}'")
+    excluded_categories = set(str(c).strip().lower() for c in measure.get("exclude_categories", ()))
     unit_category = generator_frame[generator_frame["Collection"].astype(str).str.strip() == "Generator"].drop_duplicates("Child Name").set_index("Child Name")["Category"].astype(str).str.strip().str.lower()
     allowed_categories = group_assets.get(group_key)
     collapse_name = lambda text: re.sub(r"\s+", " ", str(text)).strip()
@@ -91,8 +195,10 @@ def build_rating_raw_rows(generator_frame, month_labels, value_columns, name_map
         if len(collection_rows) == 0:
             continue
         unit_names = collection_rows[identifier_column].astype(str).map(collapse_name)
-        category_key = collection_rows["Category"].astype(str).str.strip().str.lower() if collection_name == "Generator" else collection_rows[identifier_column].map(unit_category).fillna("")
+        category_key = collection_rows["Category"].astype(str).str.strip().str.lower() if collection_name in ("Generator", "Battery") else collection_rows[identifier_column].map(unit_category).fillna("")
         member = category_key.isin(allowed_categories) if allowed_categories is not None else pd.Series(True, index=collection_rows.index)
+        if len(excluded_categories) > 0:
+            member = member & ~category_key.isin(excluded_categories)
         for include_category, include_strings in group_extra_includes.get(group_key, []):
             name_hit = pd.Series(False, index=collection_rows.index)
             for include_string in include_strings:
@@ -237,6 +343,16 @@ def load_raw_generator_for_timeslice(raw_data_path, timeslice, excel_serial_min,
         if "WARNING" in captured_line:
             print(captured_line)
     generator_frame = loaded_frames[2]
+    #the Battery rows of the same Timeslice (Ratings Chrg / Dchrg / Var O&M / Storage rows) travel on the .attrs of the Generator frame; the frame itself, its rows and the proof below are unchanged
+    battery_frame = loaded_frames[0]
+    battery_timeslice_column = next((c for c in battery_frame.columns if re.sub(r"[^a-z]", "", str(c).lower()) == "timeslice"), None)
+    if battery_timeslice_column is None:
+        battery_proven, battery_proof = False, "the raw Battery frame has no Timeslice column, so the Timeslice cannot be proven"
+    else:
+        battery_found = sorted(set(battery_frame[battery_timeslice_column].astype(str).str.strip()))
+        battery_proven = battery_found == [str(timeslice).strip()]
+        battery_proof = f"only '{timeslice}' rows ({len(battery_frame)} raw Battery row(s))" if battery_proven else f"Timeslice values found: {battery_found} (expected only '{timeslice}')"
+    generator_frame.attrs["rating_battery"] = RatingFrameHolder(battery_frame, battery_proven, battery_proof)
     timeslice_column = next((c for c in generator_frame.columns if re.sub(r"[^a-z]", "", str(c).lower()) == "timeslice"), None)
     if timeslice_column is None:
         return generator_frame, False, "the raw Generator frame has no Timeslice column, so the Timeslice cannot be proven"
@@ -1951,7 +2067,18 @@ def build_raw_ratings_tables(rating_frames, rating_definitions, rating_sections,
         table_rows = []
         for rating_definition in rating_definitions:
             measure = rating_definition["measure"]
-            raw_rows = build_rating_raw_rows(generator_frame, month_labels, value_columns, name_map, group_assets, rating_definition["group_key"], group_extra_includes, extra_match_case, measure["collections"], measure["column"], unit_factor)
+            if not rating_definition_active(rating_definition, report_rows):
+                continue
+            if measure.get("may_be_missing"):
+                pending_text = rating_measure_problem(generator_frame, measure)
+                if pending_text != "":
+                    pending_key = (rating_definition["alias"], measure.get("class", rating_definition["group_key"][0]), pending_text)
+                    if pending_key not in RATING_PENDING_REPORTED:
+                        RATING_PENDING_REPORTED.add(pending_key)
+                        print(f"  RAW DATA NOT AVAILABLE YET: Ratings ':{rating_definition['alias']}' rows ({rating_definition['source']}): {pending_text}. These rows have no raw counterpart for now and are compared automatically as soon as the raw data holds the values.")
+                    info["Rows"][rating_definition["alias"]] = info["Rows"].get(rating_definition["alias"], 0)
+                    continue
+            raw_rows = build_rating_raw_rows(generator_frame, month_labels, value_columns, name_map, group_assets, rating_definition["group_key"], group_extra_includes, extra_match_case, measure["collections"], measure["column"], rating_measure_factor(measure, unit_factor), measure)
             report_labels, ordered_keys = {}, []
             for report_row in report_rows:
                 if report_row["alias"].lower() == rating_definition["alias"].lower() and report_row["name_key"] in raw_rows and report_row["name_key"] not in report_labels:
@@ -1961,7 +2088,7 @@ def build_raw_ratings_tables(rating_frames, rating_definitions, rating_sections,
             for name_key in ordered_keys:
                 row_title = report_labels.get(name_key, f"{raw_rows[name_key]['printed']}:{rating_definition['alias']}")
                 table_rows.append([row_title] + [float(v) for v in raw_rows[name_key]["values"]])
-            info["Rows"][rating_definition["alias"]] = len(ordered_keys)
+            info["Rows"][rating_definition["alias"]] = info["Rows"].get(rating_definition["alias"], 0) + len(ordered_keys)
         info["Total Rows"] = len(table_rows)
         if len(table_rows) == 0:
             info["Note"] = "no raw Generator row belongs to the Ratings Report groups: no raw counterpart for this section"
@@ -2251,7 +2378,18 @@ def build_raw_ratings_tables(rating_frames, rating_definitions, rating_sections,
         table_rows = []
         for rating_definition in rating_definitions:
             measure = rating_definition["measure"]
-            raw_rows = build_rating_raw_rows(generator_frame, month_labels, value_columns, name_map, group_assets, rating_definition["group_key"], group_extra_includes, extra_match_case, measure["collections"], measure["column"], unit_factor)
+            if not rating_definition_active(rating_definition, report_rows):
+                continue
+            if measure.get("may_be_missing"):
+                pending_text = rating_measure_problem(generator_frame, measure)
+                if pending_text != "":
+                    pending_key = (rating_definition["alias"], measure.get("class", rating_definition["group_key"][0]), pending_text)
+                    if pending_key not in RATING_PENDING_REPORTED:
+                        RATING_PENDING_REPORTED.add(pending_key)
+                        print(f"  RAW DATA NOT AVAILABLE YET: Ratings ':{rating_definition['alias']}' rows ({rating_definition['source']}): {pending_text}. These rows have no raw counterpart for now and are compared automatically as soon as the raw data holds the values.")
+                    info["Rows"][rating_definition["alias"]] = info["Rows"].get(rating_definition["alias"], 0)
+                    continue
+            raw_rows = build_rating_raw_rows(generator_frame, month_labels, value_columns, name_map, group_assets, rating_definition["group_key"], group_extra_includes, extra_match_case, measure["collections"], measure["column"], rating_measure_factor(measure, unit_factor), measure)
             report_labels, ordered_keys = {}, []
             for report_row in report_rows:
                 if report_row["alias"].lower() == rating_definition["alias"].lower() and report_row["name_key"] in raw_rows and report_row["name_key"] not in report_labels:
@@ -2261,7 +2399,7 @@ def build_raw_ratings_tables(rating_frames, rating_definitions, rating_sections,
             for name_key in ordered_keys:
                 row_title = report_labels.get(name_key, f"{raw_rows[name_key]['printed']}:{rating_definition['alias']}")
                 table_rows.append([row_title] + [float(v) for v in raw_rows[name_key]["values"]])
-            info["Rows"][rating_definition["alias"]] = len(ordered_keys)
+            info["Rows"][rating_definition["alias"]] = info["Rows"].get(rating_definition["alias"], 0) + len(ordered_keys)
         info["Total Rows"] = len(table_rows)
         if len(table_rows) == 0:
             info["Note"] = "no raw Generator row belongs to the Ratings Report groups: no raw counterpart for this section"
@@ -2805,7 +2943,9 @@ def build_rating_raw_name_lookup(rating_frames, rating_definitions, rating_secti
         section_names = name_lookup.setdefault(section_key, {})
         for rating_definition in rating_definitions:
             measure = rating_definition["measure"]
-            raw_rows = build_rating_raw_rows(generator_frame, month_labels, value_columns, name_map, group_assets, rating_definition["group_key"], group_extra_includes, extra_match_case, measure["collections"], measure["column"], unit_factor)
+            if not rating_definition_active(rating_definition, report_rows):
+                continue
+            raw_rows = build_rating_raw_rows(generator_frame, month_labels, value_columns, name_map, group_assets, rating_definition["group_key"], group_extra_includes, extra_match_case, measure["collections"], measure["column"], rating_measure_factor(measure, unit_factor), measure)
             report_labels = {}
             for report_row in report_rows:
                 if report_row["alias"].lower() == rating_definition["alias"].lower() and report_row["name_key"] in raw_rows and report_row["name_key"] not in report_labels:
@@ -3769,14 +3909,19 @@ def rating_expand_sections_03e(raw_tables, px_tables, section_keys):
         if raw_section is None or px_section is None:
             expanded_sections.append((section_key, raw_section, px_section, section_key))
             continue
+        seen_aliases = set()
         for rating_definition in rating_definitions:
             alias_text, measure_text = rating_definition["alias"], rating_definition["measure"]
+            if alias_text.lower() in seen_aliases:
+                continue                                        #an alias with two definitions (Var O&M: Generator + Battery) is ONE section: its rows are selected by the alias
+            seen_aliases.add(alias_text.lower())
+            basis_label_text, basis_column_text = rating_alias_basis(rating_definitions, alias_text, RATING_UNIT_FACTOR)
             alias_suffix = ":" + alias_text.lower()
             alias_rows = lambda frame, suffix=alias_suffix: frame[frame.iloc[:, 0].fillna("").astype(str).str.strip().str.lower().str.endswith(suffix)].reset_index(drop=True)
             raw_alias_part, px_alias_part = alias_rows(raw_section["data"]), alias_rows(px_section["data"])
             if len(raw_alias_part) == 0 and len(px_alias_part) == 0:
                 continue
-            alias_title = f"{px_section['title']} :{alias_text} rows (raw {measure_text['label']} x {RATING_UNIT_FACTOR:g})"
+            alias_title = f"{px_section['title']} :{alias_text} rows (raw {basis_label_text})"
             expanded_sections.append((f"{section_key} ({alias_text})", {"title": alias_title, "data": raw_alias_part}, {"title": alias_title, "data": px_alias_part}, section_key))
     return expanded_sections
 def rating_expand_sections(raw_tables, px_tables, section_keys):
@@ -3786,14 +3931,19 @@ def rating_expand_sections(raw_tables, px_tables, section_keys):
         if raw_section is None or px_section is None:
             expanded_sections.append((section_key, raw_section, px_section, section_key))
             continue
+        seen_aliases = set()
         for rating_definition in rating_definitions:
             alias_text, measure_text = rating_definition["alias"], rating_definition["measure"]
+            if alias_text.lower() in seen_aliases:
+                continue                                        #an alias with two definitions (Var O&M: Generator + Battery) is ONE section: its rows are selected by the alias
+            seen_aliases.add(alias_text.lower())
+            basis_label_text, basis_column_text = rating_alias_basis(rating_definitions, alias_text, RATING_UNIT_FACTOR)
             alias_suffix = ":" + alias_text.lower()
             alias_rows = lambda frame: frame[frame.iloc[:, 0].fillna("").astype(str).str.strip().str.lower().str.endswith(alias_suffix)].reset_index(drop=True)
             raw_alias_part, px_alias_part = alias_rows(raw_section["data"]), alias_rows(px_section["data"])
             if len(raw_alias_part) == 0 and len(px_alias_part) == 0:
                 continue
-            alias_title = f"{px_section['title']} :{alias_text} rows (raw {measure_text['label']} x {RATING_UNIT_FACTOR:g})"
+            alias_title = f"{px_section['title']} :{alias_text} rows (raw {basis_label_text})"
             expanded_sections.append((f"{section_key} ({alias_text})", {"title": alias_title, "data": raw_alias_part}, {"title": alias_title, "data": px_alias_part}, section_key))
     return expanded_sections
 def rating_reference_with_alias_labels(reference_frame):
@@ -5550,16 +5700,21 @@ def rating_expand_sections(raw_tables, px_tables, section_keys):
         if raw_section is None or px_section is None:
             expanded_sections.append((section_key, raw_section, px_section, missing_reason))
             continue
+        seen_aliases = set()
         for rating_definition in rating_definitions:
             alias_text, measure_text = rating_definition["alias"], rating_definition["measure"]
+            if alias_text.lower() in seen_aliases:
+                continue                                        #an alias with two definitions (Var O&M: Generator + Battery) is ONE section: its rows are selected by the alias
+            seen_aliases.add(alias_text.lower())
+            basis_label_text, basis_column_text = rating_alias_basis(rating_definitions, alias_text, RATING_UNIT_FACTOR)
             alias_suffix = ":" + alias_text.lower()
             alias_rows = lambda frame: frame[frame.iloc[:, 0].fillna("").astype(str).str.strip().str.lower().str.endswith(alias_suffix)].reset_index(drop=True)
             raw_alias_part, px_alias_part = alias_rows(raw_section["data"]), alias_rows(px_section["data"])
             if len(raw_alias_part) == 0 and len(px_alias_part) == 0:
                 continue
-            alias_title = f"{px_section['title']} :{alias_text} rows (raw {measure_text['label']} x {RATING_UNIT_FACTOR:g})"
+            alias_title = f"{px_section['title']} :{alias_text} rows (raw {basis_label_text})"
             alias_label = f"{section_key} ({alias_text})"
-            rating_alignment_texts[alias_label] = f"{measure_text['column']} x {RATING_UNIT_FACTOR:g} -> report units ({alias_text} rows)"
+            rating_alignment_texts[alias_label] = f"{basis_column_text} -> report units ({alias_text} rows)"
             expanded_sections.append((alias_label, {"title": alias_title, "data": raw_alias_part}, {"title": alias_title, "data": px_alias_part}, missing_reason))
     return expanded_sections
 def extract_blueprint_sections_unit_aligned(blueprint, raw_frames, month_labels, name_map, group_assets, group_label, group_extra_rules, unit_rules, contract_factor, in_scope_tables, class_to_raw, property_to_raw_column,
@@ -6180,9 +6335,902 @@ def write_json_file(file_path, payload):
     file_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     return file_path
 
+
+################################################################################################################################################################################
+#4.00 PREPROCESSING
+################################################################################################################################################################################
+def read_oprep_requirements(workbook_path):
+    """Read from an OpRep_01 workbook what its macros and lookup tabs need (the workbook is only read): the number of effluent types (Control), the columns the MISSING INDEX CHECK counts, every lookup formula of the checked tabs that searches a KeyedData column (XMATCH, also when it points to another workbook: [1]KeyedData) together with the text it looks up, and the RUIndex roll-up table. Returns a dict: effluents_count, check_sheets (sheet -> counted column pairs), lookups [(sheet, column, row, text, KeyedData column)], external_lookups (sheet -> number of lookups that point to ANOTHER workbook), ru_rows [(key, SecRollUpGWh, PlantRollUpGWh, SecRollUp$000)]."""
+    workbook = openpyxl.load_workbook(workbook_path, read_only=True, data_only=False)
+    requirements = {"effluents_count": 8, "check_sheets": OrderedDict(), "lookups": [], "ru_rows": [], "external_lookups": Counter()}
+    for row in workbook["Control"].iter_rows(min_row=1, max_row=60, max_col=11, values_only=True):
+        if isinstance(row[1], str) and "number of effluent types" in row[1].lower() and isinstance(row[2], (int, float)):
+            requirements["effluents_count"] = int(row[2])
+        if isinstance(row[8], str) and "COUNTIFS" in row[8].upper():
+            for sheet_name, first_column, last_column in re.findall(r"COUNTIFS\(\s*'?([^'!()]+)'?!\$?([A-Z]+):\$?([A-Z]+)\s*,\s*\"#N/A\"", row[8], flags=re.I):
+                requirements["check_sheets"].setdefault(sheet_name, []).append((first_column.upper(), last_column.upper()))
+    lookup_pattern = re.compile(r"XMATCH\(\s*\$?([A-Z]+)\$?(\d+)\s*,\s*(\[\d+\])?KeyedData!\$?([A-Z]+):\$?[A-Z]+\s*\)", re.I)
+    for sheet_name, column_pairs in requirements["check_sheets"].items():
+        if sheet_name not in workbook.sheetnames:
+            continue
+        counted = [column for first_column, last_column in column_pairs if column_index_from_string(last_column) <= 6 for column in get_column_letter_range(first_column, last_column)]
+        if len(counted) == 0:
+            continue
+        sheet_rows = [list(r) for r in workbook[sheet_name].iter_rows(min_row=1, max_row=workbook[sheet_name].max_row, max_col=6, values_only=True)]
+        for row_number, cells in enumerate(sheet_rows, start=1):
+            for column in counted:
+                formula = cells[column_index_from_string(column) - 1] if column_index_from_string(column) <= len(cells) else None
+                found = lookup_pattern.search(formula) if isinstance(formula, str) else None
+                if found is None:
+                    continue
+                if found.group(3):
+                    requirements["external_lookups"][sheet_name] += 1
+                text = sheet_rows[int(found.group(2)) - 1][column_index_from_string(found.group(1)) - 1]
+                if text not in (None, ""):
+                    requirements["lookups"].append((sheet_name, column, row_number, str(text), found.group(4).upper()))
+    if "RUIndex" in workbook.sheetnames:
+        requirements["ru_rows"] = [(str(r[1]), r[2], r[3], r[4]) for r in workbook["RUIndex"].iter_rows(min_row=2, max_row=workbook["RUIndex"].max_row, max_col=5, values_only=True) if r[1] not in (None, "")]
+    workbook.close()
+    return requirements
+def get_column_letter_range(first_column, last_column):
+    """Column letters from first_column to last_column (for example 'B' to 'D' -> ['B', 'C', 'D'])."""
+    return [get_column_letter(number) for number in range(column_index_from_string(first_column), column_index_from_string(last_column) + 1)]
+def read_keyed_data_reference(workbook_path):
+    """The first four columns (ReportName, Account Name, PrimaryKey, Row) of the KeyedData tab of a workbook, for every row that has a key."""
+    workbook = openpyxl.load_workbook(workbook_path, read_only=True, data_only=True)
+    reference = [tuple(r) for r in workbook["KeyedData"].iter_rows(min_row=2, max_row=workbook["KeyedData"].max_row, max_col=4, values_only=True) if r[2] not in (None, "")]
+    workbook.close()
+    return reference
+def excel_cell_text(text):
+    """What VBA reads from a CSV field after Excel opened it: a plain number loses its formatting ('01' -> '1'), everything else stays text."""
+    if re.fullmatch(r"[-+]?\d+(\.\d+)?", text):
+        number = float(text)
+        return str(int(number)) if number.is_integer() else repr(number)
+    return text
+def format_macro_title(title_text):
+    """' ( 1) System Summary' form of a Standard table title: one leading space so that '(' is the 2nd character (CreateStandardKeys only recognises a title then) and the section number right-aligned to 2 characters, as RT Sim writes it. Returns None when the text is not a table title (the '(1) Change Case File = ...' lines contain '=')."""
+    found = re.match(r"^\s*\(\s*(\d+[a-z]?)\s*\)\s*(.*)$", title_text, flags=re.I)
+    return None if (found is None or "=" in title_text) else " (" + found.group(1).rjust(2) + ") " + found.group(2)
+def format_macro_month_cell(text):
+    """Month header cell as RT Sim writes it: ' Jan-2026 ' (4-digit year, one space each side, so Excel keeps it as text and Control!F10 can read the year from the last 4 characters), ' Tot-2026 ', '    Total '. Any other text is returned unchanged."""
+    found = re.fullmatch(r"\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Tot)[-\s]?(\d{2}|\d{4})\s*", text, flags=re.I)
+    if found:
+        return " " + found.group(1).capitalize() + "-" + ("20" + found.group(2) if len(found.group(2)) == 2 else found.group(2)) + " "
+    return "    Total " if text.strip().lower() == "total" else text
+def macro_rating_section_name(text, rules):
+    """The Ratings section name the macro recognises (exact spelling) for a section name of the report, by the first rule (letters / digits prefix, macro name) that fits; None when no rule fits."""
+    key = re.sub(r"[^a-z0-9]", "", text.lower())
+    return next((name for prefix, name in rules if key.startswith(prefix)), None)
+def find_report_titles(rows, is_ratings):
+    """Line indexes (0-based) of the table titles (Standard) or section titles (Ratings: one-cell line directly above a month-header row), in file order."""
+    month_pattern = re.compile(r"^\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Tot)[-\s]?\d{2,4}\s*$", re.I)
+    header_positions = [month_header_position(cells, month_pattern) for cells in rows]
+    titles = []
+    for index, cells in enumerate(rows):
+        if len([c for c in cells if c.strip() != ""]) == 1 and len(cells) > 0 and cells[0].strip() != "":
+            if (is_ratings and index + 1 < len(rows) and header_positions[index + 1] is not None) or ((not is_ratings) and format_macro_title(cells[0]) is not None):
+                titles.append(index)
+    return titles, header_positions
+def make_macro_ready_rows(rows, is_ratings, first_title_row, rating_rules):
+    """Make a Standard or Ratings report readable for the OpRep_01 macros without touching a number: blank lines so that the first title is on first_title_row (the macros read from row 26 and Control takes the start year from B28), Standard titles as ' ( 1) Title', Ratings section names as the macro spells them, month headers as padded text. Returns (new rows, changes [(kind, original line, old text, new text)], layout note)."""
+    rows = [list(cells) for cells in rows]
+    titles, header_positions = find_report_titles(rows, is_ratings)
+    changes = []
+    layout_note = ""
+    if len(titles) > 0:
+        shift = first_title_row - (titles[0] + 1)
+        if shift > 0:
+            rows = [[] for _ in range(shift)] + rows
+            header_positions = [None] * shift + header_positions
+            titles = [t + shift for t in titles]
+            changes.append(("blank lines added at the top", 0, "", str(shift)))
+        elif shift < 0 and count_leading_blank_rows(rows) >= -shift:
+            rows = rows[-shift:]
+            header_positions = header_positions[-shift:]
+            titles = [t + shift for t in titles]
+            changes.append(("blank lines removed from the top", 0, str(-shift), ""))
+        elif shift < 0:
+            layout_note = f"the first title is on line {titles[0] + 1}, below row {first_title_row}, and the lines above it are not blank: nothing was removed"
+    for index in titles:
+        old = rows[index][0]
+        new = (" " + macro_rating_section_name(old, rating_rules)) if (is_ratings and macro_rating_section_name(old, rating_rules) is not None) else (old if is_ratings else format_macro_title(old))
+        if new != old:
+            rows[index][0] = new
+            changes.append(("section name" if is_ratings else "table title", index + 1, old, new))
+    for index, offset in enumerate(header_positions):
+        if offset is not None:
+            changed_cells = 0
+            for position in range(offset, len(rows[index])):
+                new = format_macro_month_cell(rows[index][position])
+                if new != rows[index][position]:
+                    rows[index][position] = new
+                    changed_cells += 1
+            if changed_cells > 0:
+                changes.append(("month header cells", index + 1, "", f"{changed_cells} cells"))
+    return rows, changes, layout_note
+def simulate_macro_keys(rows, is_ratings, effluents_count, first_row=26):
+    """What CreateKeys.CreateStandardKeys / CreateRatingKeys of OpRep_01 writes into KeyedData columns A-D for a report file, row by row exactly as the macro reads it (column A only, from row 26 to the last used row). Returns (keys [(ReportName, Account Name, PrimaryKey, Row)], error text or '')."""
+    last_row = len(rows)
+    while last_row > 0 and all(c == "" for c in rows[last_row - 1]):
+        last_row -= 1
+    column_a = [excel_cell_text(cells[0]) if len(cells) > 0 else "" for cells in rows[:last_row]]
+    trim = lambda text: text.strip(" ")
+    keys = []
+    report_name, section, plant, suffix = "", "", "", ""
+    row = first_row
+    while row <= last_row:
+        label = column_a[row - 1]
+        if trim(label) != "":
+            if is_ratings:
+                if trim(label) in ("On-peak Mon-Sat", "Off-peak 23-6 Mon-Sun", "Sunday On-peak", "ATC Mon-Sun"):
+                    report_name = trim(label)
+                else:
+                    keys.append(("Rating Report", trim(label), "Rat_" + report_name + "_" + trim(label), row))
+            elif label.find("(") + 1 == 2:
+                if label.find(")", 1) < 0:
+                    return keys, f"row {row}: the table title has no ')': the macro stops with a run-time error"
+                section = trim(label[2:label.find(")", 1)])
+                report_name = trim(label)
+            else:
+                if section in ("3", "6"):
+                    if trim(label[:5]) == "":
+                        suffix = "_" + trim(label)
+                        record = "Std_" + section + plant + suffix
+                    else:
+                        plant = "_" + trim(label)
+                        record = "Std_" + section + plant + "_Total"
+                    keys.append((report_name, record[4:124], record, row))
+                elif section in ("14", "73"):
+                    if trim(label[:16 if section == "14" else 17]) == ("Total Effluents" if section == "14" else "Total Effluent $"):
+                        suffix = trim(label)
+                    else:
+                        plant = trim(label)
+                        record = "Std_" + section + "_" + suffix + "_" + plant
+                        keys.append((report_name, record[4:124], record, row))
+                elif section in ("27", "28"):
+                    if len(label) > 2:
+                        plant = trim(label)
+                    else:
+                        day_text = trim(label)
+                        suffix = "Day" + (day_text.zfill(2) if day_text.isdigit() else day_text)
+                        record = "Std_" + section + "_" + plant + "_" + suffix
+                        keys.append((report_name, record[4:124], record, row))
+                elif section == "32":
+                    for block_row in range(row, row + (effluents_count - 1) * 4 + 1, 4):
+                        record = "Std_" + section + "_" + (column_a[block_row - 1] if block_row <= last_row else "")
+                        keys.append((report_name, record[4:124], record, block_row + 2))
+                    row = row + ((effluents_count - 1) * 4) + 3
+                else:
+                    record = "Std_" + section + "_" + trim(label)
+                    keys.append((report_name, record[4:124], record, row))
+        row += 1
+    return keys, ""
+def simulate_rollup_flags(key_texts, ru_rows):
+    """What SetRollup.SetRollupFlags writes into KeyedData columns E / F / G: for every RUIndex row whose key is in KeyedData column C (XMATCH, case-insensitive, first match) the three roll-up names are written to that KeyedData row. key_texts = the PrimaryKey of every KeyedData row in order. Returns (flags {KeyedData position: (E, F, G)}, RUIndex keys that are not in KeyedData - the macro stops with a type-mismatch error at the first of them)."""
+    first_position = {}
+    for position, text in enumerate(key_texts):
+        first_position.setdefault(text.casefold(), position)
+    flags, missing = {}, []
+    for key, sec_gwh, plant_gwh, sec_cost in ru_rows:
+        position = first_position.get(key.casefold())
+        if position is None:
+            missing.append(key)
+        else:
+            flags[position] = (sec_gwh, plant_gwh, sec_cost)
+    return flags, missing
+def predict_missing_index(lookups, key_texts, flags):
+    """The #N/A counts of the MISSING INDEX CHECK for the lookup tabs: a lookup is #N/A when its text is not in the KeyedData column it searches (C = PrimaryKey from key_texts, E / F / G = the roll-up names of flags). Returns {sheet: [(row, column, text, KeyedData column)]} with only the lookups that fail."""
+    columns = {"C": set(t.casefold() for t in key_texts), "E": set(), "F": set(), "G": set()}
+    for sec_gwh, plant_gwh, sec_cost in flags.values():
+        for letter, value in (("E", sec_gwh), ("F", plant_gwh), ("G", sec_cost)):
+            if value not in (None, ""):
+                columns[letter].add(str(value).casefold())
+    failing = OrderedDict()
+    for sheet_name, column, row_number, text, target in lookups:
+        if text.casefold() not in columns.get(target, set()):
+            failing.setdefault(sheet_name, []).append((row_number, column, text, target))
+    return failing
+def compare_keyed_data(predicted, reference):
+    """Predicted KeyedData rows against a reference KeyedData (both lists of (ReportName, Account Name, PrimaryKey, Row)), grouped by <Std|Rat>_<section>: rows in each, keys in both (case-insensitive), keys only in the reference, keys only in the prediction, and rows in both whose ReportName / Account Name differ. Returns an OrderedDict group -> counts."""
+    group_of = lambda key: "_".join(str(key).split("_", 2)[:2])
+    predicted_by_key = {str(r[2]).casefold(): r for r in predicted}
+    reference_by_key = {str(r[2]).casefold(): r for r in reference}
+    summary = OrderedDict()
+    for source, name in ((reference, "reference"), (predicted, "predicted")):
+        for r in source:
+            summary.setdefault(group_of(r[2]), Counter())[name] += 1
+    for key, r in reference_by_key.items():
+        counts = summary[group_of(r[2])]
+        if key in predicted_by_key:
+            counts["both"] += 1
+            counts["name differs"] += int((str(predicted_by_key[key][0] or "").strip(), predicted_by_key[key][1]) != (str(r[0] or "").strip(), r[1]))
+        else:
+            counts["reference only"] += 1
+    for key, r in predicted_by_key.items():
+        if key not in reference_by_key:
+            summary[group_of(r[2])]["predicted only"] += 1
+    return summary
+def report_table_spans(rows, is_ratings):
+    """{table number (Standard) or section name (Ratings): (title line index, index after its last line)} for a finished report file."""
+    titles, header_positions = find_report_titles(rows, is_ratings)
+    spans = OrderedDict()
+    for position, index in enumerate(titles):
+        name = re.match(r"^\s*\(\s*(\d+[a-z]?)\s*\)", rows[index][0], flags=re.I).group(1).lower() if not is_ratings else rows[index][0].strip()
+        spans[name] = (index, titles[position + 1] if position + 1 < len(titles) else len(rows))
+    return spans
+def add_zero_rows(rows, is_ratings, keys):
+    """Append a row of zeros for every key '<Std|Rat>_<section>_<label>' of keys at the end of its table / section (a Ratings section that does not exist is created at the end of the file, with the month-header row of the first section). Only for tables the macro keys row by row, plus the plant rows of tables 3 and 6 (not tables 14, 27, 28, 32, 73 or the fuel rows of 3 and 6). Returns (new rows, keys added, keys that could not be added with the reason)."""
+    rows = [list(cells) for cells in rows]
+    spans = report_table_spans(rows, is_ratings)
+    added, refused = [], []
+    additions = OrderedDict()
+    for key in keys:
+        section, label = key.split("_", 2)[1], key.split("_", 2)[2]
+        plant_row = (not is_ratings) and section.lower() in ("3", "6") and label.endswith("_Total") and "_" not in label[:-6]
+        if (not is_ratings) and ((section.lower() in ("14", "27", "28", "32", "73") or (section.lower() in ("3", "6") and not plant_row)) or section.lower() not in spans):
+            refused.append((key, "the table is built differently by the macro" if section.lower() in ("3", "6", "14", "27", "28", "32", "73") else "the table is not in the file"))
+        else:
+            additions.setdefault(section if is_ratings else section.lower(), []).append((key, label[:-6] if plant_row else label))
+    month_pattern = re.compile(r"^\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Tot)[-\s]?\d{2,4}\s*$", re.I)
+    header = next((cells for cells in rows if month_header_position(cells, month_pattern) is not None), None)
+    value_count = (len(header) - month_header_position(header, month_pattern)) if header else 79
+    new_sections = [name for name in additions if name not in spans]
+    for name, items in sorted(additions.items(), key=lambda item: -(spans[item[0]][1] if item[0] in spans else len(rows) + 1)):
+        if name in spans:
+            end = spans[name][1]
+            while end > spans[name][0] + 1 and all(c.strip() == "" for c in rows[end - 1]):
+                end -= 1
+            rows[end:end] = [["  " + label] + ["0"] * value_count for key, label in items]
+            added.extend(key for key, label in items)
+    for name in new_sections:
+        rows += [[], [" " + name]] + ([list(header)] if header else []) + [["  " + label] + ["0"] * value_count for key, label in additions[name]]
+        added.extend(key for key, label in additions[name])
+    return rows, added, refused
+def count_effluent_blocks(rows):
+    """Number of effluent blocks (a heading line with only a label) in table 32 of a Standard report: the number Control!C24 'Number of Effluent Types' must hold, because the macro reads that many blocks, 4 lines apart, and jumps past them."""
+    spans = report_table_spans(rows, False)
+    if "32" not in spans:
+        return 0
+    return sum(1 for cells in rows[spans["32"][0] + 1:spans["32"][1]] if len(cells) > 0 and cells[0].strip() != "" and not any(c.strip() != "" for c in cells[1:]))
+def read_oprep_requirements(workbook_path):
+    """Read from an OpRep_01 workbook what its macros and lookup tabs need (the workbook is only read): the number of effluent types (Control), the columns the MISSING INDEX CHECK counts, every lookup formula of the checked tabs that searches a KeyedData column (XMATCH, also when it points to another workbook: [1]KeyedData) together with the text it looks up, and the RUIndex roll-up table. Returns a dict: effluents_count, check_sheets (sheet -> counted column pairs), lookups [(sheet, column, row, text, KeyedData column)], external_lookups (sheet -> number of lookups that point to ANOTHER workbook), ru_rows [(key, SecRollUpGWh, PlantRollUpGWh, SecRollUp$000)]."""
+    workbook = openpyxl.load_workbook(workbook_path, read_only=True, data_only=False)
+    requirements = {"effluents_count": 8, "check_sheets": OrderedDict(), "lookups": [], "ru_rows": [], "external_lookups": Counter()}
+    for row in workbook["Control"].iter_rows(min_row=1, max_row=60, max_col=11, values_only=True):
+        if isinstance(row[1], str) and "number of effluent types" in row[1].lower() and isinstance(row[2], (int, float)):
+            requirements["effluents_count"] = int(row[2])
+        if isinstance(row[8], str) and "COUNTIFS" in row[8].upper():
+            for sheet_name, first_column, last_column in re.findall(r"COUNTIFS\(\s*'?([^'!()]+)'?!\$?([A-Z]+):\$?([A-Z]+)\s*,\s*\"#N/A\"", row[8], flags=re.I):
+                requirements["check_sheets"].setdefault(sheet_name, []).append((first_column.upper(), last_column.upper()))
+    lookup_pattern = re.compile(r"XMATCH\(\s*\$?([A-Z]+)\$?(\d+)\s*,\s*(\[\d+\])?KeyedData!\$?([A-Z]+):\$?[A-Z]+\s*\)", re.I)
+    for sheet_name, column_pairs in requirements["check_sheets"].items():
+        if sheet_name not in workbook.sheetnames:
+            continue
+        counted = [column for first_column, last_column in column_pairs if column_index_from_string(last_column) <= 6 for column in get_column_letter_range(first_column, last_column)]
+        if len(counted) == 0:
+            continue
+        sheet_rows = [list(r) for r in workbook[sheet_name].iter_rows(min_row=1, max_row=workbook[sheet_name].max_row, max_col=6, values_only=True)]
+        for row_number, cells in enumerate(sheet_rows, start=1):
+            for column in counted:
+                formula = cells[column_index_from_string(column) - 1] if column_index_from_string(column) <= len(cells) else None
+                found = lookup_pattern.search(formula) if isinstance(formula, str) else None
+                if found is None:
+                    continue
+                if found.group(3):
+                    requirements["external_lookups"][sheet_name] += 1
+                text = sheet_rows[int(found.group(2)) - 1][column_index_from_string(found.group(1)) - 1]
+                if text not in (None, ""):
+                    requirements["lookups"].append((sheet_name, column, row_number, str(text), found.group(4).upper()))
+    if "RUIndex" in workbook.sheetnames:
+        requirements["ru_rows"] = [(str(r[1]), r[2], r[3], r[4]) for r in workbook["RUIndex"].iter_rows(min_row=2, max_row=workbook["RUIndex"].max_row, max_col=5, values_only=True) if r[1] not in (None, "")]
+    workbook.close()
+    return requirements
+def get_column_letter_range(first_column, last_column):
+    """Column letters from first_column to last_column (for example 'B' to 'D' -> ['B', 'C', 'D'])."""
+    return [get_column_letter(number) for number in range(column_index_from_string(first_column), column_index_from_string(last_column) + 1)]
+def read_keyed_data_reference(workbook_path):
+    """The first four columns (ReportName, Account Name, PrimaryKey, Row) of the KeyedData tab of a workbook, for every row that has a key."""
+    workbook = openpyxl.load_workbook(workbook_path, read_only=True, data_only=True)
+    reference = [tuple(r) for r in workbook["KeyedData"].iter_rows(min_row=2, max_row=workbook["KeyedData"].max_row, max_col=4, values_only=True) if r[2] not in (None, "")]
+    workbook.close()
+    return reference
+def excel_cell_text(text):
+    """What VBA reads from a CSV field after Excel opened it: a plain number loses its formatting ('01' -> '1'), everything else stays text."""
+    if re.fullmatch(r"[-+]?\d+(\.\d+)?", text):
+        number = float(text)
+        return str(int(number)) if number.is_integer() else repr(number)
+    return text
+def format_macro_title(title_text):
+    """' ( 1) System Summary' form of a Standard table title: one leading space so that '(' is the 2nd character (CreateStandardKeys only recognises a title then) and the section number right-aligned to 2 characters, as RT Sim writes it. Returns None when the text is not a table title (the '(1) Change Case File = ...' lines contain '=')."""
+    found = re.match(r"^\s*\(\s*(\d+[a-z]?)\s*\)\s*(.*)$", title_text, flags=re.I)
+    return None if (found is None or "=" in title_text) else " (" + found.group(1).rjust(2) + ") " + found.group(2)
+def format_macro_month_cell(text):
+    """Month header cell as RT Sim writes it: ' Jan-2026 ' (4-digit year, one space each side, so Excel keeps it as text and Control!F10 can read the year from the last 4 characters), ' Tot-2026 ', '    Total '. Any other text is returned unchanged."""
+    found = re.fullmatch(r"\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Tot)[-\s]?(\d{2}|\d{4})\s*", text, flags=re.I)
+    if found:
+        return " " + found.group(1).capitalize() + "-" + ("20" + found.group(2) if len(found.group(2)) == 2 else found.group(2)) + " "
+    return "    Total " if text.strip().lower() == "total" else text
+def macro_rating_section_name(text, rules):
+    """The Ratings section name the macro recognises (exact spelling) for a section name of the report, by the first rule (letters / digits prefix, macro name) that fits; None when no rule fits."""
+    key = re.sub(r"[^a-z0-9]", "", text.lower())
+    return next((name for prefix, name in rules if key.startswith(prefix)), None)
+def find_report_titles(rows, is_ratings):
+    """Line indexes (0-based) of the table titles (Standard) or section titles (Ratings: one-cell line directly above a month-header row), in file order."""
+    month_pattern = re.compile(r"^\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Tot)[-\s]?\d{2,4}\s*$", re.I)
+    header_positions = [month_header_position(cells, month_pattern) for cells in rows]
+    titles = []
+    for index, cells in enumerate(rows):
+        if len([c for c in cells if c.strip() != ""]) == 1 and len(cells) > 0 and cells[0].strip() != "":
+            if (is_ratings and index + 1 < len(rows) and header_positions[index + 1] is not None) or ((not is_ratings) and format_macro_title(cells[0]) is not None):
+                titles.append(index)
+    return titles, header_positions
+def make_macro_ready_rows(rows, is_ratings, first_title_row, rating_rules):
+    """Make a Standard or Ratings report readable for the OpRep_01 macros without touching a number: blank lines so that the first title is on first_title_row (the macros read from row 26 and Control takes the start year from B28), Standard titles as ' ( 1) Title', Ratings section names as the macro spells them, month headers as padded text. Returns (new rows, changes [(kind, original line, old text, new text)], layout note)."""
+    rows = [list(cells) for cells in rows]
+    titles, header_positions = find_report_titles(rows, is_ratings)
+    changes = []
+    layout_note = ""
+    if len(titles) > 0:
+        shift = first_title_row - (titles[0] + 1)
+        if shift > 0:
+            rows = [[] for _ in range(shift)] + rows
+            header_positions = [None] * shift + header_positions
+            titles = [t + shift for t in titles]
+            changes.append(("blank lines added at the top", 0, "", str(shift)))
+        elif shift < 0 and count_leading_blank_rows(rows) >= -shift:
+            rows = rows[-shift:]
+            header_positions = header_positions[-shift:]
+            titles = [t + shift for t in titles]
+            changes.append(("blank lines removed from the top", 0, str(-shift), ""))
+        elif shift < 0:
+            layout_note = f"the first title is on line {titles[0] + 1}, below row {first_title_row}, and the lines above it are not blank: nothing was removed"
+    for index in titles:
+        old = rows[index][0]
+        new = (" " + macro_rating_section_name(old, rating_rules)) if (is_ratings and macro_rating_section_name(old, rating_rules) is not None) else (old if is_ratings else format_macro_title(old))
+        if new != old:
+            rows[index][0] = new
+            changes.append(("section name" if is_ratings else "table title", index + 1, old, new))
+    for index, offset in enumerate(header_positions):
+        if offset is not None:
+            changed_cells = 0
+            for position in range(offset, len(rows[index])):
+                new = format_macro_month_cell(rows[index][position])
+                if new != rows[index][position]:
+                    rows[index][position] = new
+                    changed_cells += 1
+            if changed_cells > 0:
+                changes.append(("month header cells", index + 1, "", f"{changed_cells} cells"))
+    return rows, changes, layout_note
+def simulate_macro_keys(rows, is_ratings, effluents_count, first_row=26):
+    """What CreateKeys.CreateStandardKeys / CreateRatingKeys of OpRep_01 writes into KeyedData columns A-D for a report file, row by row exactly as the macro reads it (column A only, from row 26 to the last used row). Returns (keys [(ReportName, Account Name, PrimaryKey, Row)], error text or '')."""
+    last_row = len(rows)
+    while last_row > 0 and all(c == "" for c in rows[last_row - 1]):
+        last_row -= 1
+    column_a = [excel_cell_text(cells[0]) if len(cells) > 0 else "" for cells in rows[:last_row]]
+    trim = lambda text: text.strip(" ")
+    keys = []
+    report_name, section, plant, suffix = "", "", "", ""
+    row = first_row
+    while row <= last_row:
+        label = column_a[row - 1]
+        if trim(label) != "":
+            if is_ratings:
+                if trim(label) in ("On-peak Mon-Sat", "Off-peak 23-6 Mon-Sun", "Sunday On-peak", "ATC Mon-Sun"):
+                    report_name = trim(label)
+                else:
+                    keys.append(("Rating Report", trim(label), "Rat_" + report_name + "_" + trim(label), row))
+            elif label.find("(") + 1 == 2:
+                if label.find(")", 1) < 0:
+                    return keys, f"row {row}: the table title has no ')': the macro stops with a run-time error"
+                section = trim(label[2:label.find(")", 1)])
+                report_name = trim(label)
+            else:
+                if section in ("3", "6"):
+                    if trim(label[:5]) == "":
+                        suffix = "_" + trim(label)
+                        record = "Std_" + section + plant + suffix
+                    else:
+                        plant = "_" + trim(label)
+                        record = "Std_" + section + plant + "_Total"
+                    keys.append((report_name, record[4:124], record, row))
+                elif section in ("14", "73"):
+                    if trim(label[:16 if section == "14" else 17]) == ("Total Effluents" if section == "14" else "Total Effluent $"):
+                        suffix = trim(label)
+                    else:
+                        plant = trim(label)
+                        record = "Std_" + section + "_" + suffix + "_" + plant
+                        keys.append((report_name, record[4:124], record, row))
+                elif section in ("27", "28"):
+                    if len(label) > 2:
+                        plant = trim(label)
+                    else:
+                        day_text = trim(label)
+                        suffix = "Day" + (day_text.zfill(2) if day_text.isdigit() else day_text)
+                        record = "Std_" + section + "_" + plant + "_" + suffix
+                        keys.append((report_name, record[4:124], record, row))
+                elif section == "32":
+                    for block_row in range(row, row + (effluents_count - 1) * 4 + 1, 4):
+                        record = "Std_" + section + "_" + (column_a[block_row - 1] if block_row <= last_row else "")
+                        keys.append((report_name, record[4:124], record, block_row + 2))
+                    row = row + ((effluents_count - 1) * 4) + 3
+                else:
+                    record = "Std_" + section + "_" + trim(label)
+                    keys.append((report_name, record[4:124], record, row))
+        row += 1
+    return keys, ""
+def simulate_rollup_flags(key_texts, ru_rows):
+    """What SetRollup.SetRollupFlags writes into KeyedData columns E / F / G: for every RUIndex row whose key is in KeyedData column C (XMATCH, case-insensitive, first match) the three roll-up names are written to that KeyedData row. key_texts = the PrimaryKey of every KeyedData row in order. Returns (flags {KeyedData position: (E, F, G)}, RUIndex keys that are not in KeyedData - the macro stops with a type-mismatch error at the first of them)."""
+    first_position = {}
+    for position, text in enumerate(key_texts):
+        first_position.setdefault(text.casefold(), position)
+    flags, missing = {}, []
+    for key, sec_gwh, plant_gwh, sec_cost in ru_rows:
+        position = first_position.get(key.casefold())
+        if position is None:
+            missing.append(key)
+        else:
+            flags[position] = (sec_gwh, plant_gwh, sec_cost)
+    return flags, missing
+def predict_missing_index(lookups, key_texts, flags):
+    """The #N/A counts of the MISSING INDEX CHECK for the lookup tabs: a lookup is #N/A when its text is not in the KeyedData column it searches (C = PrimaryKey from key_texts, E / F / G = the roll-up names of flags). Returns {sheet: [(row, column, text, KeyedData column)]} with only the lookups that fail."""
+    columns = {"C": set(t.casefold() for t in key_texts), "E": set(), "F": set(), "G": set()}
+    for sec_gwh, plant_gwh, sec_cost in flags.values():
+        for letter, value in (("E", sec_gwh), ("F", plant_gwh), ("G", sec_cost)):
+            if value not in (None, ""):
+                columns[letter].add(str(value).casefold())
+    failing = OrderedDict()
+    for sheet_name, column, row_number, text, target in lookups:
+        if text.casefold() not in columns.get(target, set()):
+            failing.setdefault(sheet_name, []).append((row_number, column, text, target))
+    return failing
+def compare_keyed_data(predicted, reference):
+    """Predicted KeyedData rows against a reference KeyedData (both lists of (ReportName, Account Name, PrimaryKey, Row)), grouped by <Std|Rat>_<section>: rows in each, keys in both (case-insensitive), keys only in the reference, keys only in the prediction, and rows in both whose ReportName / Account Name differ. Returns an OrderedDict group -> counts."""
+    group_of = lambda key: "_".join(str(key).split("_", 2)[:2])
+    predicted_by_key = {str(r[2]).casefold(): r for r in predicted}
+    reference_by_key = {str(r[2]).casefold(): r for r in reference}
+    summary = OrderedDict()
+    for source, name in ((reference, "reference"), (predicted, "predicted")):
+        for r in source:
+            summary.setdefault(group_of(r[2]), Counter())[name] += 1
+    for key, r in reference_by_key.items():
+        counts = summary[group_of(r[2])]
+        if key in predicted_by_key:
+            counts["both"] += 1
+            counts["name differs"] += int((str(predicted_by_key[key][0] or "").strip(), predicted_by_key[key][1]) != (str(r[0] or "").strip(), r[1]))
+        else:
+            counts["reference only"] += 1
+    for key, r in predicted_by_key.items():
+        if key not in reference_by_key:
+            summary[group_of(r[2])]["predicted only"] += 1
+    return summary
+def report_table_spans(rows, is_ratings):
+    """{table number (Standard) or section name (Ratings): (title line index, index after its last line)} for a finished report file."""
+    titles, header_positions = find_report_titles(rows, is_ratings)
+    spans = OrderedDict()
+    for position, index in enumerate(titles):
+        name = re.match(r"^\s*\(\s*(\d+[a-z]?)\s*\)", rows[index][0], flags=re.I).group(1).lower() if not is_ratings else rows[index][0].strip()
+        spans[name] = (index, titles[position + 1] if position + 1 < len(titles) else len(rows))
+    return spans
+def add_zero_rows(rows, is_ratings, keys):
+    """Append a row of zeros for every key '<Std|Rat>_<section>_<label>' of keys at the end of its table / section (a Ratings section that does not exist is created at the end of the file, with the month-header row of the first section). Only for tables the macro keys row by row, plus the plant rows of tables 3 and 6 (not tables 14, 27, 28, 32, 73 or the fuel rows of 3 and 6). Returns (new rows, keys added, keys that could not be added with the reason)."""
+    rows = [list(cells) for cells in rows]
+    spans = report_table_spans(rows, is_ratings)
+    added, refused = [], []
+    additions = OrderedDict()
+    for key in keys:
+        section, label = key.split("_", 2)[1], key.split("_", 2)[2]
+        plant_row = (not is_ratings) and section.lower() in ("3", "6") and label.endswith("_Total") and "_" not in label[:-6]
+        if (not is_ratings) and ((section.lower() in ("14", "27", "28", "32", "73") or (section.lower() in ("3", "6") and not plant_row)) or section.lower() not in spans):
+            refused.append((key, "the table is built differently by the macro" if section.lower() in ("3", "6", "14", "27", "28", "32", "73") else "the table is not in the file"))
+        else:
+            additions.setdefault(section if is_ratings else section.lower(), []).append((key, label[:-6] if plant_row else label))
+    month_pattern = re.compile(r"^\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Tot)[-\s]?\d{2,4}\s*$", re.I)
+    header = next((cells for cells in rows if month_header_position(cells, month_pattern) is not None), None)
+    value_count = (len(header) - month_header_position(header, month_pattern)) if header else 79
+    new_sections = [name for name in additions if name not in spans]
+    for name, items in sorted(additions.items(), key=lambda item: -(spans[item[0]][1] if item[0] in spans else len(rows) + 1)):
+        if name in spans:
+            end = spans[name][1]
+            while end > spans[name][0] + 1 and all(c.strip() == "" for c in rows[end - 1]):
+                end -= 1
+            rows[end:end] = [["  " + label] + ["0"] * value_count for key, label in items]
+            added.extend(key for key, label in items)
+    for name in new_sections:
+        rows += [[], [" " + name]] + ([list(header)] if header else []) + [["  " + label] + ["0"] * value_count for key, label in additions[name]]
+        added.extend(key for key, label in additions[name])
+    return rows, added, refused
+def count_effluent_blocks(rows):
+    """Number of effluent blocks (a heading line with only a label) in table 32 of a Standard report: the number Control!C24 'Number of Effluent Types' must hold, because the macro reads that many blocks, 4 lines apart, and jumps past them."""
+    spans = report_table_spans(rows, False)
+    if "32" not in spans:
+        return 0
+    return sum(1 for cells in rows[spans["32"][0] + 1:spans["32"][1]] if len(cells) > 0 and cells[0].strip() != "" and not any(c.strip() != "" for c in cells[1:]))
+def simulate_prepared_reports(prep, effluents_used, assumed_keys, ru_rows, lookups):
+    """Run the macro simulation on every prepared report of prep (report -> dict with 'rows' and 'is_ratings'); the keys and the macro error text of each report are stored in its dict ('keys', 'macro_error'). Returns (keyed rows of all reports, key texts including the keys assumed present, roll-up flags, RUIndex keys missing from KeyedData, predicted #N/A lookups per tab)."""
+    for item in prep.values():
+        item["keys"], item["macro_error"] = simulate_macro_keys(item["rows"], item["is_ratings"], effluents_used)
+    keyed = [k for item in prep.values() for k in item["keys"]]
+    key_texts = [k[2] for k in keyed] + list(assumed_keys)
+    flags, ru_missing = simulate_rollup_flags(key_texts, ru_rows)
+    return keyed, key_texts, flags, ru_missing, predict_missing_index(lookups, key_texts, flags)
+def read_keyed_data_reference_fast(workbook_path, last_column="D"):
+    """Same result as read_keyed_data_reference (the first four columns of every row of the KeyedData tab that has a PrimaryKey in column C, as tuples), but read straight from the sheet XML: only the first cells of every row are looked at, so the 48 MB tab is read in about a second instead of parsing every one of its 1.5 million cells. Whenever anything is not exactly the layout this reader expects (another cell type, a date-formatted number, a cell without its reference, a missing part) the original read_keyed_data_reference is used instead, so the result never differs."""
+    try:
+        import xml.etree.ElementTree as ET
+        from openpyxl.styles.numbers import BUILTIN_FORMATS, is_date_format
+        main_ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+        relationship_ns = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+        unescape_xml = lambda text: re.sub(r"&(#x[0-9a-fA-F]+|#[0-9]+|lt|gt|amp|quot|apos);", lambda m: {"lt": "<", "gt": ">", "amp": "&", "quot": '"', "apos": "'"}.get(m.group(1)) or chr(int(m.group(1)[2:], 16) if m.group(1)[1] == "x" else int(m.group(1)[1:])), text)
+        with zipfile.ZipFile(workbook_path) as archive:
+            names = set(archive.namelist())
+            workbook_root = ET.fromstring(archive.read("xl/workbook.xml"))
+            relationship_id = next(sheet.get(relationship_ns + "id") for sheet in workbook_root.iter(main_ns + "sheet") if sheet.get("name") == "KeyedData")
+            target = next(rel.get("Target") for rel in ET.fromstring(archive.read("xl/_rels/workbook.xml.rels")) if rel.get("Id") == relationship_id)
+            sheet_path = target.lstrip("/") if target.startswith("/") else "xl/" + target
+            custom_formats = {}
+            date_styles = set()
+            if "xl/styles.xml" in names:
+                styles_root = ET.fromstring(archive.read("xl/styles.xml"))
+                custom_formats = {int(node.get("numFmtId")): node.get("formatCode") for node in styles_root.iter(main_ns + "numFmt")}
+                cell_formats = styles_root.find(main_ns + "cellXfs")
+                for style_index, xf in enumerate(cell_formats if cell_formats is not None else []):
+                    format_code = custom_formats.get(int(xf.get("numFmtId", 0))) or BUILTIN_FORMATS.get(int(xf.get("numFmtId", 0)))
+                    if format_code and is_date_format(format_code):
+                        date_styles.add(style_index)
+            shared_strings = []
+            if "xl/sharedStrings.xml" in names:
+                strings_xml = archive.read("xl/sharedStrings.xml").decode("utf-8")
+                for match in re.finditer(r"<si\b[^>]*?(?:/>|>(.*?)</si>)", strings_xml, re.S):
+                    body = re.sub(r"<rPh\b.*?</rPh>", "", match.group(1) or "", flags=re.S)
+                    pieces = re.findall(r"<t\b[^>]*?(?:/>|>(.*?)</t>)", body, re.S)
+                    shared_strings.append(unescape_xml("".join(pieces).replace("\r\n", "\n").replace("\r", "\n")).replace("x005F_", ""))
+            sheet_xml = archive.read(sheet_path).decode("utf-8")
+        if sheet_xml.count("<c ") != sheet_xml.count('<c r="') or "<row " not in sheet_xml:
+            raise ValueError("cells without a reference")
+        dimension = re.search(r'<dimension ref="[A-Z]+\d+(?::[A-Z]+(\d+))?"', sheet_xml)
+        max_row = int(dimension.group(1)) if dimension and dimension.group(1) else None
+        cell_pattern = re.compile(r'<c r="([A-Z]+)(\d+)"([^>]*?)(?:/>|>(.*?)</c>)', re.S)
+        reference = []
+        for row_xml in sheet_xml.split("<row ")[1:]:
+            row_values = {}
+            for cell in cell_pattern.finditer(row_xml):
+                column, row_number = cell.group(1), int(cell.group(2))
+                if len(column) > 1 or column > last_column:
+                    break
+                attributes, body = cell.group(3), cell.group(4) or ""
+                cell_type = re.search(r'\bt="(\w+)"', attributes)
+                cell_type = cell_type.group(1) if cell_type else "n"
+                style = re.search(r'\bs="(\d+)"', attributes)
+                value_node = re.search(r"<v>(.*?)</v>", body, re.S)
+                if cell_type == "inlineStr":
+                    pieces = re.findall(r"<t\b[^>]*?(?:/>|>(.*?)</t>)", re.sub(r"<rPh\b.*?</rPh>", "", body, flags=re.S), re.S)
+                    value = unescape_xml("".join(pieces).replace("\r\n", "\n").replace("\r", "\n"))
+                elif value_node is None or value_node.group(1) == "":
+                    value = None
+                elif cell_type == "s":
+                    value = shared_strings[int(value_node.group(1))]
+                elif cell_type == "str":
+                    value = unescape_xml(value_node.group(1).replace("\r\n", "\n").replace("\r", "\n"))
+                elif cell_type == "n":
+                    if style and int(style.group(1)) in date_styles:
+                        raise ValueError("date-formatted number")
+                    number_text = value_node.group(1)
+                    value = float(number_text) if any(c in number_text for c in ".eE") else int(number_text)
+                elif cell_type == "b":
+                    value = bool(int(value_node.group(1)))
+                elif cell_type == "e":
+                    value = unescape_xml(value_node.group(1))
+                else:
+                    raise ValueError("unexpected cell type " + cell_type)
+                row_values[column] = (row_number, value)
+            if len(row_values) == 0:
+                continue
+            row_number = next(iter(row_values.values()))[0]
+            if row_number < 2 or (max_row is not None and row_number > max_row):
+                continue
+            row = tuple(row_values[column][1] if column in row_values else None for column in "ABCDEFG"[:"ABCDEFG".index(last_column) + 1])
+            if row[2] not in (None, ""):
+                reference.append(row)
+        return reference
+    except Exception:
+        return read_keyed_data_reference(workbook_path) if last_column == "D" else read_keyed_data_columns(workbook_path, last_column)
+def read_oprep_requirements_quick(workbook_path):
+    """read_oprep_requirements with the cached copy of the linked workbook not parsed (load_workbook(keep_links=False)): the lookup formulas, including the '[1]KeyedData' ones, are read as text exactly as before, so the result is identical; only the time spent on the link cache is saved."""
+    import functools
+    original_load_workbook = openpyxl.load_workbook
+    openpyxl.load_workbook = functools.partial(original_load_workbook, keep_links=False)
+    try:
+        return read_oprep_requirements(workbook_path)
+    finally:
+        openpyxl.load_workbook = original_load_workbook
+def read_workbook_cached(kind, workbook_path, reader):
+    """reader(workbook_path), remembered for the next run in this session (plexos4_workbook_cache) as long as the file keeps its name, modified time and size. Returns (result, True when it came from the cache). A workbook that is open in Excel is reported in plain words."""
+    cache = globals().setdefault("plexos4_workbook_cache", {})
+    status = os.stat(workbook_path)
+    cache_key = (kind, os.path.abspath(workbook_path), status.st_mtime_ns, status.st_size)
+    for old_key in [k for k in cache if k[0] == kind and k != cache_key]:
+        del cache[old_key]
+    from_cache = cache_key in cache
+    if not from_cache:
+        try:
+            cache[cache_key] = reader(workbook_path)
+        except PermissionError:
+            raise PermissionError(f"The workbook is open in Excel and cannot be read: {workbook_path}. Close it (or save a copy) and run this cell again.")
+    return cache[cache_key], from_cache
+################################################################################################################################################################################
+#4.00 POST-LOAD TESTS (OpRep01 after the BLUE button)
+################################################################################################################################################################################
+POST_LOAD_ERROR_TEXTS = {"#N/A", "#REF!", "#VALUE!", "#DIV/0!", "#NAME?", "#NUM!", "#NULL!", "#SPILL!", "#CALC!"}
+def is_date_value(value):
+    """True for a date / datetime cell value (the name datetime is the CLASS in this file, so the module is imported here)."""
+    import datetime as datetime_module
+    return isinstance(value, (datetime_module.datetime, datetime_module.date))
+def is_number_value(value):
+    """True for an int / float cell value (a bool is not a number)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+def sheet_value_text(value):
+    """A cell value as comparable text: None = '', a whole number without '.0', everything else stripped text."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and math.isfinite(value) and value == int(value):
+        return str(int(value))
+    return str(value).strip()
+def integer_or_none(value):
+    """int(float(value)) or None when the value is not a number."""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+def year_of_value(value):
+    """The year of a date, of an Excel date serial, of a plain year number (1900-2200) or of the first 4-digit number in a text; None when there is none."""
+    if value is None:
+        return None
+    if is_date_value(value):
+        return value.year
+    if is_number_value(value):
+        if math.isfinite(value) and float(value) == int(value) and 1900 <= int(value) <= 2200:
+            return int(value)
+        try:
+            from openpyxl.utils.datetime import from_excel
+            return from_excel(value).year
+        except Exception:
+            return None
+    found = re.search(r"(\d{4})", str(value))
+    return int(found.group(1)) if found else None
+def read_cell_address(rows, address):
+    """The value at an Excel address ('F10') of a list of row tuples (rows[0] = Excel row 1); None when the address is outside the rows."""
+    from openpyxl.utils.cell import coordinate_to_tuple
+    row_number, column_number = coordinate_to_tuple(address)
+    return rows[row_number - 1][column_number - 1] if row_number - 1 < len(rows) and column_number - 1 < len(rows[row_number - 1]) else None
+def cell_address(row_index, column_index):
+    """Excel address of a 0-based row and column index (0, 5 -> 'F1')."""
+    return f"{get_column_letter(column_index + 1)}{row_index + 1}"
+def find_sheet_name(sheet_names, wanted_name):
+    """The sheet whose name equals wanted_name (case-insensitive), else the first that contains it, else None."""
+    for sheet_name in sheet_names:
+        if sheet_name.casefold() == str(wanted_name).casefold():
+            return sheet_name
+    for sheet_name in sheet_names:
+        if str(wanted_name).casefold() in sheet_name.casefold():
+            return sheet_name
+    return None
+def read_sheet_rows(worksheet, max_row=None, max_col=None):
+    """The values of a read-only worksheet as a list of row tuples (the sheet dimension recorded in the file is ignored, it is often wrong)."""
+    try:
+        worksheet.reset_dimensions()
+    except Exception:
+        pass
+    return [tuple(row) for row in worksheet.iter_rows(max_row=max_row, max_col=max_col, values_only=True)]
+def find_loaded_report_sheet(head_rows, report_key, wanted_name, sheet_titles):
+    """The sheet that holds a loaded report: wanted_name when given, else the sheet whose cell A27 is a table title (Standard: starts with '(') or one of the four Ratings section names; a sheet with 'standard' / 'rating' in its name wins a tie. head_rows = {sheet: first rows}. None when there is no such sheet."""
+    if wanted_name:
+        return find_sheet_name(sheet_titles, wanted_name)
+    rating_names = {"on-peak mon-sat", "off-peak 23-6 mon-sun", "sunday on-peak", "atc mon-sun"}
+    hits = []
+    for sheet_title, rows in head_rows.items():
+        if len(rows) < 27 or len(rows[26]) == 0:
+            continue
+        title_cell = sheet_value_text(rows[26][0])
+        if (report_key == "std" and title_cell.startswith("(")) or (report_key == "rat" and title_cell.casefold() in rating_names):
+            hits.append(sheet_title)
+    name_word = "standard" if report_key == "std" else "rating"
+    hits.sort(key=lambda title: (name_word not in title.casefold(), title))
+    return hits[0] if hits else None
+def scan_error_cells(worksheet, max_col=6, max_examples=25):
+    """Excel error values (#N/A, #REF!, ...) in the first max_col columns of a read-only worksheet. Returns the count and the first max_examples (address, error text)."""
+    error_count, examples = 0, []
+    for row_index, row in enumerate(read_sheet_rows(worksheet, max_col=max_col)):
+        for column_index, value in enumerate(row):
+            if isinstance(value, str) and value.strip() in POST_LOAD_ERROR_TEXTS:
+                error_count += 1
+                if len(examples) < max_examples:
+                    examples.append((cell_address(row_index, column_index), value.strip()))
+    return error_count, examples
+def read_missing_index_cells(workbook_path, control_sheet_name="Control", max_row=60, max_col=11):
+    """Where the MISSING INDEX CHECK counts are: the Control cells whose formula is COUNTIFS('<tab>'!A:C,"#N/A") (the same formulas read_oprep_requirements reads). Returns an OrderedDict tab -> Control cell address."""
+    cells = OrderedDict()
+    workbook = openpyxl.load_workbook(workbook_path, read_only=True, data_only=False, keep_links=False)
+    try:
+        control_title = find_sheet_name(workbook.sheetnames, control_sheet_name)
+        if control_title is None:
+            return cells
+        for row_number, row in enumerate(workbook[control_title].iter_rows(min_row=1, max_row=max_row, max_col=max_col, values_only=True), start=1):
+            for column_number, value in enumerate(row, start=1):
+                if isinstance(value, str) and "COUNTIFS" in value.upper():
+                    for found in re.findall(r"COUNTIFS\(\s*'?([^'!()]+)'?!\$?([A-Z]+):\$?([A-Z]+)\s*,\s*\"#N/A\"", value, flags=re.I):
+                        cells.setdefault(found[0], f"{get_column_letter(column_number)}{row_number}")
+    finally:
+        workbook.close()
+    return cells
+def read_loaded_oprep(workbook_path, keyed_sheet_name, control_sheet_name, report_sheet_names, check_sheet_names):
+    """Read a SAVED OpRep01 workbook (values, not formulas; KeyedData is read separately by read_keyed_data_reference_fast): the sheet names, the first 200 x 20 cells of the Control tab, the Control cells of the MISSING INDEX CHECK, the sheet that holds each loaded report (Standard / Ratings) with all its rows, and the Excel error values of the first 6 columns of every tab in check_sheet_names. Returns a dict: titles, keyed_title, control_title, control, missing_index_cells, report_titles, reports, errors."""
+    missing_index_cells = read_missing_index_cells(workbook_path, control_sheet_name)
+    workbook = openpyxl.load_workbook(workbook_path, read_only=True, data_only=True, keep_links=False)
+    try:
+        sheet_titles = [worksheet.title for worksheet in workbook.worksheets]
+        keyed_title, control_title = find_sheet_name(sheet_titles, keyed_sheet_name), find_sheet_name(sheet_titles, control_sheet_name)
+        head_rows = {title: read_sheet_rows(workbook[title], max_row=30, max_col=2) for title in sheet_titles if title not in (keyed_title, control_title)}
+        report_titles_found = OrderedDict((report_key, find_loaded_report_sheet(head_rows, report_key, report_sheet_names.get(report_key), sheet_titles)) for report_key in ("std", "rat"))
+        loaded = {"titles": sheet_titles, "keyed_title": keyed_title, "control_title": control_title, "control": [], "missing_index_cells": missing_index_cells, "report_titles": report_titles_found, "reports": {}, "errors": OrderedDict()}
+        if control_title is not None:
+            loaded["control"] = read_sheet_rows(workbook[control_title], max_row=200, max_col=20)
+        for report_key, report_title in report_titles_found.items():
+            if report_title is not None:
+                loaded["reports"][report_key] = read_sheet_rows(workbook[report_title])
+        wanted_check = {name.casefold() for name in check_sheet_names}
+        for sheet_title in sheet_titles:
+            if sheet_title.casefold() in wanted_check:
+                loaded["errors"][sheet_title] = scan_error_cells(workbook[sheet_title])
+        return loaded
+    finally:
+        workbook.close()
+def read_keyed_data_columns(workbook_path, last_column="G"):
+    """Slow fallback of read_keyed_data_reference_fast for more than 4 columns: columns A to last_column of every KeyedData row that has a PrimaryKey in column C (header row skipped), each row padded with None to the full width."""
+    width = column_index_from_string(last_column)
+    workbook = openpyxl.load_workbook(workbook_path, read_only=True, data_only=True, keep_links=False)
+    try:
+        worksheet = workbook["KeyedData"]
+        rows = [tuple(row) + (None,) * (width - len(row)) for row in read_sheet_rows(worksheet, max_col=width)[1:]]
+    finally:
+        workbook.close()
+    return [row for row in rows if row[2] not in (None, "")]
+def build_loaded_key_records(keyed_rows):
+    """The KeyedData rows of the loaded workbook (columns A to G) as records (position, ReportName, Account Name, PrimaryKey, report row, (E, F, G roll-up names)), all as comparable text / int."""
+    records = []
+    for position, row in enumerate(keyed_rows, start=1):
+        row = tuple(row) + (None,) * max(0, 7 - len(row))
+        records.append((position, sheet_value_text(row[0]), sheet_value_text(row[1]), sheet_value_text(row[2]), integer_or_none(row[3]), tuple(sheet_value_text(value) for value in row[4:7])))
+    return records
+def build_predicted_key_index(keyed, flags):
+    """The KeyedData the preprocessing predicted as {casefolded PrimaryKey: (ReportName, Account Name, report row, (E, F, G), PrimaryKey)} (the first of a repeated key wins, like the XMATCH of the macros) and the number of repeated keys. flags = {position in keyed: (E, F, G)}."""
+    predicted, repeated_count = OrderedDict(), 0
+    for position, key_row in enumerate(keyed):
+        key = str(key_row[2]).strip().casefold()
+        if key in predicted:
+            repeated_count += 1
+            continue
+        predicted[key] = (sheet_value_text(key_row[0]), sheet_value_text(key_row[1]), integer_or_none(key_row[3]), tuple(sheet_value_text(value) for value in tuple(flags.get(position, (None, None, None)))[:3]), str(key_row[2]))
+    return predicted, repeated_count
+def add_post_load_mismatch(mismatches, max_stored, check_name, sheet_name, location, expected, found, kind):
+    """Remember one difference (check, sheet, location, expected, found, kind) while fewer than max_stored are stored (the counts of the checks are always complete)."""
+    if len(mismatches) < max_stored:
+        mismatches.append((check_name, sheet_name, location, expected, found, kind))
+def compare_loaded_keyed_data(loaded_records, predicted, key_prefixes, mismatches, max_stored):
+    """The KeyedData the macros wrote against the predicted one, for the keys that start with one of key_prefixes (casefolded, for example ('std_', 'rat_'); the fixed / variable cost keys of the workbook are not compared). Returns a dict: loaded_by_key, repeated (keys that appear twice), loaded_only, predicted_only, name_differs, row_differs, flag_differs (the lists hold the loaded records; predicted_only holds PrimaryKeys). Every difference is added to mismatches."""
+    loaded_by_key, repeated = OrderedDict(), []
+    for record in loaded_records:
+        key = record[3].casefold()
+        if not key.startswith(key_prefixes):
+            continue
+        if key in loaded_by_key:
+            repeated.append(record[3])
+        else:
+            loaded_by_key[key] = record
+    loaded_only = [record for key, record in loaded_by_key.items() if key not in predicted]
+    predicted_only = [values[4] for key, values in predicted.items() if key not in loaded_by_key]
+    name_differs, row_differs, flag_differs = [], [], []
+    for key, record in loaded_by_key.items():
+        if key not in predicted:
+            continue
+        predicted_report, predicted_account, predicted_row, predicted_flags, _ = predicted[key]
+        if (record[1], record[2]) != (predicted_report, predicted_account):
+            name_differs.append(record)
+            add_post_load_mismatch(mismatches, max_stored, "KeyedData vs prediction", "KeyedData", record[3], f"A / B = {predicted_report} | {predicted_account}", f"A / B = {record[1]} | {record[2]}", "ReportName / Account Name differs")
+        if record[4] != predicted_row:
+            row_differs.append(record)
+            add_post_load_mismatch(mismatches, max_stored, "KeyedData vs prediction", "KeyedData", record[3], f"D = {predicted_row}", f"D = {record[4]}", "report row (column D) differs")
+        if record[5] != predicted_flags:
+            flag_differs.append(record)
+            add_post_load_mismatch(mismatches, max_stored, "KeyedData vs prediction", "KeyedData", record[3], f"E / F / G = {predicted_flags}", f"E / F / G = {record[5]}", "roll-up names (E / F / G) differ")
+    for record in loaded_only:
+        add_post_load_mismatch(mismatches, max_stored, "KeyedData vs prediction", "KeyedData", record[3], "(not predicted)", record[3], "key only in the loaded workbook")
+    for primary_key in predicted_only:
+        add_post_load_mismatch(mismatches, max_stored, "KeyedData vs prediction", "KeyedData", primary_key, primary_key, "(missing)", "predicted key missing in the loaded workbook")
+    return {"loaded_by_key": loaded_by_key, "repeated": repeated, "loaded_only": loaded_only, "predicted_only": predicted_only, "name_differs": name_differs, "row_differs": row_differs, "flag_differs": flag_differs}
+def compare_loaded_report_sheet(report_label, sheet_name, csv_rows, sheet_rows, first_data_row, rel_tol, abs_tol, mismatches, max_stored):
+    """Every non-empty cell of a ready report file (csv_rows, from line first_data_row) against the same cell of the loaded sheet (sheet_rows, from the same row): a number must be the same number (within rel_tol / abs_tol), any other text the same text (a plain number in a label cell is compared the way Excel reads it, '01' = '1'). Differences: number differs, value / text missing in the sheet, number stored as text, text instead of a number, converted to a date, text differs. Returns a Counter of the differences, the cells compared, the sum of the numbers in the file, the sum of the numbers in the sheet and the number of non-empty sheet cells that are not in the file."""
+    counts, compared, csv_sum, sheet_sum, extra_cells = Counter(), 0, 0.0, 0.0, 0
+    number_pattern = re.compile(r"^-?\d+(\.\d+)?([eE][-+]?\d+)?$")
+    for row_index in range(first_data_row - 1, max(len(csv_rows), len(sheet_rows))):
+        csv_row = csv_rows[row_index] if row_index < len(csv_rows) else []
+        sheet_row = sheet_rows[row_index] if row_index < len(sheet_rows) else ()
+        for column_index, cell_text in enumerate(csv_row):
+            expected = cell_text.strip()
+            if expected == "":
+                continue
+            actual = sheet_row[column_index] if column_index < len(sheet_row) else None
+            compared += 1
+            kind = None
+            if column_index > 0 and number_pattern.match(expected):
+                expected_number = float(expected)
+                csv_sum += expected_number
+                if is_number_value(actual):
+                    sheet_sum += actual
+                    if abs(actual - expected_number) > abs_tol + rel_tol * abs(expected_number):
+                        kind = "number differs"
+                elif actual is None or str(actual).strip() == "":
+                    kind = "value missing in the sheet"
+                elif is_date_value(actual):
+                    kind = "converted to a date"
+                else:
+                    try:
+                        float(str(actual).strip())
+                        kind = "number stored as text"
+                    except ValueError:
+                        kind = "text instead of a number"
+            elif actual is None or str(actual).strip() == "":
+                kind = "text missing in the sheet"
+            elif is_date_value(actual):
+                kind = "converted to a date"
+            elif sheet_value_text(actual) != excel_cell_text(expected):
+                kind = "text differs"
+            if kind is not None:
+                counts[kind] += 1
+                add_post_load_mismatch(mismatches, max_stored, f"{report_label} report vs ready file", sheet_name, cell_address(row_index, column_index), expected, "" if actual is None else str(actual), kind)
+        extra_cells += sum(1 for value in sheet_row[len(csv_row):] if value is not None and str(value).strip() != "")
+    return counts, compared, csv_sum, sheet_sum, extra_cells
+def find_workbook_external_links(workbook_path):
+    """The external-link parts (xl/externalLinks/*.xml) of a workbook, i.e. links such as '[1]KeyedData' to another workbook. Returns the list of parts and an error text ('' when the file could be inspected)."""
+    try:
+        with zipfile.ZipFile(workbook_path) as workbook_zip:
+            return [name for name in workbook_zip.namelist() if name.startswith("xl/externalLinks/") and name.endswith(".xml")], ""
+    except Exception as error:
+        return [], f"{type(error).__name__}: {error}"
+def format_file_time(timestamp):
+    """A file time stamp as 'YYYY-MM-DD HH:MM:SS' (local time)."""
+    import datetime as datetime_module
+    return datetime_module.datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
 ################################################################################################################################################################################
 #4.00, 4.01, & 4.04
 ################################################################################################################################################################################
+def sheet_rows_as_text_rows(sheet_rows):
+    """The rows of a loaded report sheet (values read from the saved OpRep_01 workbook) as the list of text rows read_csv_rows gives for a CSV file, so the section parser of PlexOS-4.01 / 4.04 can read the sheet exactly like a file: None = '', text as it is (padding kept), a date as ISO text, a number as its repr(); trailing empty cells are cut. Row n of the result is row n of the sheet."""
+    text_rows = []
+    for sheet_row in sheet_rows:
+        cells = ["" if value is None else (value if isinstance(value, str) else (value.isoformat() if is_date_value(value) else repr(value))) for value in sheet_row]
+        while cells and cells[-1] == "":
+            cells.pop()
+        text_rows.append(cells)
+    return text_rows
+def index_keyed_sections(loaded_records):
+    """The PrimaryKeys of a loaded KeyedData tab grouped by report type and section: {('std', '<table number>') or ('rat', '<rating section>'): [record, ...]}, both casefolded. A key is 'Std_<table>_<row value>' or 'Rat_<section>_<row value>' (the keys the OpRep_01 macros write); other keys (the FC / VC cost keys) are not indexed. loaded_records = build_loaded_key_records(...)."""
+    keys_by_section = defaultdict(list)
+    for record in loaded_records:
+        key_parts = record[3].split("_", 2)
+        if len(key_parts) == 3 and key_parts[0].casefold() in ("std", "rat"):
+            keys_by_section[(key_parts[0].casefold(), key_parts[1].strip().casefold())].append(record)
+    return keys_by_section
+def check_keyed_section_records(keys_by_section, report_kind, section_key, first_line, last_line, labels_in_section):
+    """Is one section of the loaded report represented in the KeyedData tab? Every section that has labelled rows needs at least one KeyedData key, and every key of the section must point (column D) to a row of the loaded sheet that lies inside the section (first_line = its title line, last_line = the last line before the next title; both 1-based). Returns passed, key_count, outside_section (the keys that point elsewhere) and a detail text."""
+    section_records = keys_by_section.get((report_kind, str(section_key).strip().casefold()), [])
+    outside_section = [record for record in section_records if record[4] is None or not (first_line < record[4] <= last_line)]
+    has_keys = len(section_records) > 0 or labels_in_section == 0
+    detail = f"KeyedData tab: {len(section_records)} key(s) for this {'rating section' if report_kind == 'rat' else 'table'}, {len(outside_section)} pointing outside lines {first_line + 1}-{last_line}" + ("" if has_keys else f"; none, but the section has {labels_in_section} labelled row(s)") + (f"; e.g. {outside_section[0][3]} -> row {outside_section[0][4]}" if outside_section else "")
+    return has_keys and len(outside_section) == 0, len(section_records), outside_section, detail
+def find_section_last_line(title_lines, first_line, row_count):
+    """The last line (1-based) of the section that starts on first_line: the line before the next section title of title_lines (1-based), or the last line of the sheet."""
+    later_titles = [line for line in title_lines if line > first_line]
+    return (min(later_titles) - 1) if later_titles else row_count
 def strip_path_text(answer):
     """A path answer without surrounding spaces / quotes, and without the r"..." prefix of a path pasted from code."""
     answer = str(answer).strip().strip('"').strip("'")
@@ -6325,7 +7373,46 @@ def section_mapping_row(record, tc_id, report_label, status_text):
     """One row of the section mapping results (CSV and the Section Mapping sheet use the same row)."""
     return [tc_id, f"{report_label} Report", record["id"], record["px_title"], record["px_line"], record["kd_key"] if record["kd_key"] is not None else "", record["kd_title"], record["kd_line"] if record["kd_line"] is not None else "", record["method"],
             status_text[record["destination_defined"]], status_text[record["structure_valid"]], record["structure_detail"], status_text[record["category_valid"]], record["category_detail"], status_text[record["traceable"]], record["trace_detail"], record["rows"], record["rows_traced"], status_text[record["section_pass"]]]
-
+def simulate_everything():
+    simulated = OrderedDict()
+    for report, item in prep.items():
+        item["keys"], item["macro_error"] = simulate_macro_keys(item["rows"], item["is_ratings"], effluents_used)
+        simulated[report] = item["keys"]
+    keyed = [k for report in prep for k in prep[report]["keys"]]
+    key_texts = [k[2] for k in keyed] + assumed_keys
+    flags, ru_missing = simulate_rollup_flags(key_texts, oprep["ru_rows"])
+    return keyed, key_texts, flags, ru_missing, predict_missing_index(oprep["lookups"], key_texts, flags)
+################################################################################################################################################################################
+#4.01 / 4.04 SECTION MAPPING AGAINST THE LOADED OpRep_01 WORKBOOK
+################################################################################################################################################################################
+def sheet_rows_as_text_rows(sheet_rows):
+    """The rows of a loaded report sheet (values read from the saved OpRep_01 workbook) as the list of text rows read_csv_rows gives for a CSV file, so the section parser of PlexOS-4.01 / 4.04 can read the sheet exactly like a file: None = '', text as it is (padding kept), a date as ISO text, a number as its repr(); trailing empty cells are cut. Row n of the result is row n of the sheet."""
+    text_rows = []
+    for sheet_row in sheet_rows:
+        cells = ["" if value is None else (value if isinstance(value, str) else (value.isoformat() if is_date_value(value) else repr(value))) for value in sheet_row]
+        while cells and cells[-1] == "":
+            cells.pop()
+        text_rows.append(cells)
+    return text_rows
+def index_keyed_sections(loaded_records):
+    """The PrimaryKeys of a loaded KeyedData tab grouped by report type and section: {('std', '<table number>') or ('rat', '<rating section>'): [record, ...]}, both casefolded. A key is 'Std_<table>_<row value>' or 'Rat_<section>_<row value>' (the keys the OpRep_01 macros write); other keys (the FC / VC cost keys) are not indexed. loaded_records = build_loaded_key_records(...)."""
+    keys_by_section = defaultdict(list)
+    for record in loaded_records:
+        key_parts = record[3].split("_", 2)
+        if len(key_parts) == 3 and key_parts[0].casefold() in ("std", "rat"):
+            keys_by_section[(key_parts[0].casefold(), key_parts[1].strip().casefold())].append(record)
+    return keys_by_section
+def check_keyed_section_records(keys_by_section, report_kind, section_key, first_line, last_line, labels_in_section):
+    """Is one section of the loaded report represented in the KeyedData tab? Every section that has labelled rows needs at least one KeyedData key, and every key of the section must point (column D) to a row of the loaded sheet that lies inside the section (first_line = its title line, last_line = the last line before the next title; both 1-based). Returns passed, key_count, outside_section (the keys that point elsewhere) and a detail text."""
+    section_records = keys_by_section.get((report_kind, str(section_key).strip().casefold()), [])
+    outside_section = [record for record in section_records if record[4] is None or not (first_line < record[4] <= last_line)]
+    has_keys = len(section_records) > 0 or labels_in_section == 0
+    detail = f"KeyedData tab: {len(section_records)} key(s) for this {'rating section' if report_kind == 'rat' else 'table'}, {len(outside_section)} pointing outside lines {first_line + 1}-{last_line}" + ("" if has_keys else f"; none, but the section has {labels_in_section} labelled row(s)") + (f"; e.g. {outside_section[0][3]} -> row {outside_section[0][4]}" if outside_section else "")
+    return has_keys and len(outside_section) == 0, len(section_records), outside_section, detail
+def find_section_last_line(title_lines, first_line, row_count):
+    """The last line (1-based) of the section that starts on first_line: the line before the next section title of title_lines (1-based), or the last line of the sheet."""
+    later_titles = [line for line in title_lines if line > first_line]
+    return (min(later_titles) - 1) if later_titles else row_count
 ################################################################################################################################################################################
 ################################################################################################################################################################################
 
